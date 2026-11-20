@@ -172,3 +172,68 @@ def pipeline_archive_execute(policy_id: int) -> dict[str, Any]:
     from app.services.event_archive import EventArchiveService
     svc = EventArchiveService()
     return svc.execute_archive(policy_id=policy_id)
+
+
+class ArchiveRestoreRequest(BaseModel):
+    batch_id: str
+    partitions: list[str] = []
+    requester: str = ""
+    mode: str = "auto"
+
+
+class ArchiveMigrateRequest(BaseModel):
+    batch_id: str
+    partitions: list[str] = []
+    verify: bool = True
+
+
+@router.post("/archive-migrate")
+def pipeline_archive_migrate(
+    request: ArchiveMigrateRequest,
+) -> dict[str, Any]:
+    """链路11: 旧版 zlib 归档 → gzip v2（带分区摘要）→ 资产校验。"""
+    from app.services.archive_migration import ArchiveMigrationService
+    svc = ArchiveMigrationService()
+    return svc.migrate_batch(
+        request.batch_id, request.partitions or None, verify=request.verify,
+    )
+
+
+@router.post("/archive-restore-to-lake")
+def pipeline_archive_restore_to_lake(request: ArchiveRestoreRequest) -> dict[str, Any]:
+    """链路12: 归档恢复 → 数据湖原分区 → 回写恢复清单。
+
+    完整覆盖：event_archive（迁移/校验）→ data_lake_sink（落湖）→ 恢复清单。
+    """
+    from app.services.archive_migration import ArchiveMigrationService
+    svc = ArchiveMigrationService()
+    return svc.restore(
+        request.batch_id, request.partitions,
+        requester=request.requester, mode=request.mode,
+    )
+
+
+@router.get("/archive-lake-verify")
+def pipeline_archive_lake_verify(
+    batch_id: str, partition: str, receipt_id: str | None = None,
+) -> dict[str, Any]:
+    """链路13: 用数据湖查询核对归档恢复的记录是否真的落在原分区。"""
+    from app.services.archive_migration import ArchiveMigrationService
+    from app.services.archive_v2 import canonical_partition
+    svc = ArchiveMigrationService()
+    lake = svc.query_lake(partition, receipt_id=receipt_id)
+    manifest = svc.get_manifest(batch_id)["partitions"].get(
+        canonical_partition(partition), {},
+    )
+    lake_ids = set(lake.get("event_ids", []))
+    manifest_ids = set(manifest.get("event_ids", []))
+    return {
+        "ok": lake["ok"] and manifest_ids.issubset(lake_ids),
+        "batch_id": batch_id,
+        "partition": lake["partition"],
+        "lake_total": lake["total"],
+        "lake_event_ids": lake.get("event_ids", []),
+        "manifest_event_ids": sorted(manifest_ids),
+        "missing_in_lake": sorted(manifest_ids - lake_ids),
+        "receipt_ids": lake.get("receipt_ids", []),
+    }

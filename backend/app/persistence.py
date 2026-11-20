@@ -23,7 +23,8 @@ class JsonStore:
 
     def __init__(self, base_dir: str | None = None) -> None:
         if base_dir is None:
-            base_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store")
+            from app.paths import data_store_root
+            base_dir = str(data_store_root())
         self._base_dir = Path(base_dir)
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()

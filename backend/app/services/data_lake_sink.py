@@ -9,12 +9,26 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import uuid
 import zlib
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+from app.paths import lake_root
 from app.persistence import json_store
+from app.services import archive_state
+from app.services.archive_v2 import (
+    canonical_partition,
+    date_to_lake_partition,
+    event_identity,
+    normalize_archive_date,
+    safe_name,
+)
 from app.services.base import BaseModuleService
+
+_LAKE_LOCK = threading.RLock()
 
 
 class DataLakeSinkService(BaseModuleService):
@@ -29,7 +43,7 @@ class DataLakeSinkService(BaseModuleService):
 
     def __init__(self) -> None:
         super().__init__()
-        self._lake_base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "lake")
+        self._lake_base = Path(lake_root())
         os.makedirs(self._lake_base, exist_ok=True)
         self._write_stats: dict[str, int] = {}
 
@@ -161,6 +175,145 @@ class DataLakeSinkService(BaseModuleService):
             "partition": f"events/{event_type}/{date_str}",
         }
 
+    # ──────────────────────────────────────────────
+    # 归档恢复落湖
+    # ──────────────────────────────────────────────
+    def write_restored_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        partition: str,
+        archive_date: str,
+        receipt_id: str,
+        batch_id: str,
+        source_file: str,
+        source_format: str,
+        source_verified: bool,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """把归档恢复的事件写回数据湖原分区（按事件身份幂等）。
+
+        同一条源记录只要此前恢复过（无论上线还是回滚、无论来自旧版还是
+        gzip v2），都不会再次写入；回执里记录它被哪个回执占用过。
+        """
+        partition = canonical_partition(partition)
+        date_partition = date_to_lake_partition(normalize_archive_date(archive_date))
+        partition_path = self._lake_base / "events" / partition / date_partition
+        partition_path.mkdir(parents=True, exist_ok=True)
+
+        existing_ids = self._existing_event_ids(partition)
+        written_ids: list[str] = []
+        skipped_ids: list[str] = []
+        duplicate_refs: dict[str, Any] = {}
+        rows: list[dict[str, Any]] = []
+        ledger_entries: dict[str, dict[str, Any]] = {}
+        now = datetime.now(timezone.utc).isoformat()
+
+        with _LAKE_LOCK:
+            for record in events:
+                identity = event_identity(record)
+                prior = existing_ids.get(identity)
+                if prior is not None:
+                    skipped_ids.append(identity)
+                    duplicate_refs[identity] = prior
+                    continue
+                rows.append({
+                    "event_id": identity,
+                    "event_type": partition,
+                    "source_channel_id": record.get("source_channel_id", 0),
+                    "payload": record.get("payload", record),
+                    "ingested_at": record.get("ingested_at", now),
+                    "record_hash": record.get("record_hash")
+                    or hashlib.sha256(json.dumps(
+                        record.get("payload", record), sort_keys=True, ensure_ascii=False,
+                    ).encode()).hexdigest()[:16],
+                    "archive_partition": partition,
+                    "archive_date": normalize_archive_date(archive_date),
+                    "archive_batch": batch_id,
+                    "restore_run_id": run_id,
+                    "restore_receipt_id": receipt_id,
+                    "archive_source_file": source_file,
+                    "archive_source_format": source_format,
+                    "archive_source_verified": source_verified,
+                    "restored_at": now,
+                })
+                written_ids.append(identity)
+
+            lake_file = ""
+            if rows:
+                file_name = (
+                    f"restore_{safe_token(receipt_id)}_{datetime.now(timezone.utc).strftime('%H%M%S')}.json"
+                )
+                lake_path = partition_path / file_name
+                tmp = lake_path.with_name(lake_path.name + ".tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(rows, f, ensure_ascii=False, default=str)
+                os.replace(tmp, lake_path)
+                lake_file = str(lake_path.resolve())
+                for row in rows:
+                    ledger_entries[f"{partition}|{row['event_id']}"] = {
+                        "partition": partition,
+                        "event_id": row["event_id"],
+                        "receipt_id": receipt_id,
+                        "batch_id": batch_id,
+                        "run_id": run_id,
+                        "lake_file": lake_file,
+                        "archive_source_file": source_file,
+                        "archive_source_format": source_format,
+                        "restored_at": now,
+                    }
+                archive_state.ledger_put_many(ledger_entries)
+                self._write_stats[partition] = self._write_stats.get(partition, 0) + len(rows)
+
+        return {
+            "ok": True,
+            "partition": partition,
+            "lake_partition": f"events/{partition}/{date_partition}",
+            "lake_dates": [date_partition],
+            "lake_files": [lake_file] if lake_file else [],
+            "written_event_ids": written_ids,
+            "skipped_event_ids": skipped_ids,
+            "duplicate_refs": duplicate_refs,
+            "written_rows": len(rows),
+        }
+
+    def _existing_event_ids(self, partition: str) -> dict[str, dict[str, Any]]:
+        """收集分区内已有事件身份：优先用恢复索引，其次扫描湖文件。"""
+        existing: dict[str, dict[str, Any]] = {}
+        for entry in archive_state.ledger_all(partition).values():
+            event_id = str(entry.get("event_id") or "")
+            if event_id:
+                existing[event_id] = {
+                    "receipt_id": entry.get("receipt_id"),
+                    "batch_id": entry.get("batch_id"),
+                    "restored_at": entry.get("restored_at"),
+                    "origin": "ledger",
+                }
+        base = self._lake_base / "events" / partition
+        if not base.exists():
+            return existing
+        for path in sorted(base.glob("*/*/*/*.json")):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            items = data if isinstance(data, list) else [data]
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                event_id = str(row.get("event_id") or "")
+                if not event_id or event_id in existing:
+                    continue
+                existing[event_id] = {
+                    "receipt_id": row.get("restore_receipt_id"),
+                    "batch_id": row.get("archive_batch"),
+                    "restored_at": row.get("restored_at") or row.get("ingested_at"),
+                    "origin": "lake_scan",
+                    "file": path.name,
+                }
+        return existing
+
     def get_lake_stats(self) -> dict[str, Any]:
         """获取数据湖存储统计信息。"""
         total_files = 0
@@ -186,7 +339,7 @@ class DataLakeSinkService(BaseModuleService):
                         by_type[etype] = by_type.get(etype, 0) + 1
 
         return {
-            "base_dir": self._lake_base,
+            "base_dir": str(self._lake_base),
             "total_files": total_files,
             "total_size_bytes": total_size,
             "total_size_mb": round(total_size / (1024 * 1024), 2),
@@ -235,3 +388,7 @@ class DataLakeSinkService(BaseModuleService):
             "lake_size_mb": lake_stats.get("total_size_mb", 0),
             "operation": self.OPERATION_TERM,
         }
+
+def safe_token(value: str) -> str:
+    """把回执 ID 等标识整理成安全的文件名片段。"""
+    return safe_name(value, "restore")

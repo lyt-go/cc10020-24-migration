@@ -79,3 +79,42 @@ npm run dev
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA
+
+## 归档格式升级与分区恢复
+
+`event_archive` 模块在原有归档策略之外，新增了一条可重试的归档升级链路：
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/archive/batches` | 列出归档批次、分区和文件格式 |
+| `POST /api/archive/{batch}/migrate` | 旧版 `zlib` → 带分区摘要的 `gzip-v2`，可重复执行 |
+| `POST /api/archive/{batch}/verify` | 校验 gzip v2 的字节摘要、分区摘要和事件身份 |
+| `POST /api/archive/restore` | 恢复入口，按分区返回回执 |
+| `GET /api/archive/{batch}/manifest` | 批次恢复清单（已恢复来源记录、实际文件） |
+| `GET /api/archive/receipts/{id}` | 单条回执，含实际使用的压缩文件与被拒绝候选 |
+| `GET /api/archive/receipts/{id}/legacy` | 旧版恢复环境的回执视图 |
+| `GET /api/archive/source-row?partition=&event_id=` | 从已恢复的来源行反查原回执 |
+| `GET /api/archive/lake?partition=` | 查询数据湖原分区，核对实际恢复的记录 |
+| `GET /api/archive/{batch}/inspect?partition=` | 检查 gzip 头、日期、分区和事件身份 |
+
+对应链路入口：`POST /api/pipeline/archive-migrate`、
+`POST /api/pipeline/archive-restore-to-lake`、
+`GET /api/pipeline/archive-lake-verify`。前端「归档恢复核对」页面复用同一组接口。
+
+### 升级部署约定
+
+- **迁移重试**：资产按 `批次/分区/格式/版本` 登记在 `<data_store>/archive/_state/assets.json`。
+  已通过校验且分区摘要一致时，重试直接复用，不产生新版本；未校验版本不会被当成已迁移。
+- **恢复选择**：`auto` 模式优先使用已通过校验的 gzip v2，否则回退到可读旧版 `zlib`；
+  损坏的旧文件和未校验/被篡改的新版都会出现在回执的 `rejected_candidates` 里，绝不冒充可用数据。
+  `gzip` 模式只接受已校验 gzip v2，`legacy` 模式模拟旧版恢复环境。
+- **数据湖**：恢复数据写入 `lake/events/<分区>/<年>/<月>/<日>`，每行带
+  `archive_partition`、`archive_date`、`restore_receipt_id` 和 `archive_source_file`；
+  按事件身份去重，上线重试或回滚都不会多灌同一个源记录。
+- **恢复清单**：每次恢复运行把结果回写到 `<data_store>/archive/_state/manifests/<批次>.json`，
+  失败分区的 `last_failure` 与上一次成功的 `source_file`/`event_ids` 同时保留。
+- **回滚可查**：回执、恢复清单和湖内索引都持久化，旧版恢复环境重启后仍能按回执 ID
+  或来源行反查原始压缩文件。
+
+归档、数据湖和 JSON 仓库默认落在 `backend/data_store`，可用 `APP_DATA_STORE_DIR`
+指向独立目录（测试即使用该变量隔离）。

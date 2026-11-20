@@ -6,12 +6,15 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import zlib
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
+from app.paths import archive_root, lake_root
 from app.persistence import json_store
 from app.services.base import BaseModuleService
 
@@ -28,7 +31,7 @@ class EventArchiveService(BaseModuleService):
 
     def __init__(self) -> None:
         super().__init__()
-        self._archive_base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "archive")
+        self._archive_base = str(archive_root())
         os.makedirs(self._archive_base, exist_ok=True)
         self._archive_history: list[dict[str, Any]] = []
 
@@ -54,7 +57,7 @@ class EventArchiveService(BaseModuleService):
         retention_days = int(policy.get("保留天数", "90") or "90")
 
         # 扫描数据湖
-        lake_base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "lake")
+        lake_base = str(lake_root())
         events_dir = os.path.join(lake_base, "events")
 
         total_archived = 0
@@ -94,7 +97,14 @@ class EventArchiveService(BaseModuleService):
                         archive_name = f"{rel_path}_{f}"
                         archive_path = os.path.join(archive_batch, archive_name)
 
-                        if compress_format == "zlib":
+                        if compress_format in ("gzip", "gzip-v2", "gzip_v2"):
+                            # 升级后的归档直接产出带分区摘要的 gzip v2。
+                            with open(filepath, "rb") as src:
+                                raw = src.read()
+                            self._write_gzip_archive(
+                                archive_batch, archive_date, root, events_dir, f, raw,
+                            )
+                        elif compress_format == "zlib":
                             with open(filepath, "rb") as src:
                                 compressed = zlib.compress(src.read())
                             with open(archive_path + ".zlib", "wb") as dst:
@@ -127,6 +137,35 @@ class EventArchiveService(BaseModuleService):
             "cleaned_old": cleaned,
         }
 
+    def _write_gzip_archive(
+        self, archive_batch: str, archive_date: str, root: str, events_dir: str,
+        file_name: str, raw: bytes,
+    ) -> str:
+        """把单个湖分区文件写成 gzip v2 归档，保留日期、实际分区和事件身份。"""
+        from app.services.archive_v2 import (
+            build_gzip_payload, normalize_records, partition_from_path, write_gzip_v2,
+        )
+
+        rel_dir = os.path.relpath(root, events_dir).replace(os.sep, "/")
+        rel_path = f"{rel_dir}/{file_name}".lstrip("./")
+        partition, date = partition_from_path(rel_path, fallback_date=archive_date[:4] + "-" + archive_date[4:6] + "-" + archive_date[6:])
+        try:
+            records = normalize_records(json.loads(raw.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            records = []
+        payload = build_gzip_payload(
+            batch_id=os.path.basename(archive_batch),
+            partition=partition,
+            archive_date=date or archive_date,
+            events=records,
+        )
+        target = os.path.join(
+            archive_batch,
+            f"{partition}_{(date or archive_date).replace('-', '')}.gzip",
+        )
+        write_gzip_v2(target, payload)
+        return target
+
     def _clean_expired_archives(self, retention_days: int) -> int:
         """清理超过保留期的归档文件。"""
         cleaned = 0
@@ -135,6 +174,8 @@ class EventArchiveService(BaseModuleService):
             return 0
 
         for root, dirs, files in os.walk(self._archive_base):
+            # 资产登记/回执/恢复清单属于恢复元数据，不参与过期清理。
+            dirs[:] = [d for d in dirs if not d.startswith(("_", "."))]
             for f in files:
                 filepath = os.path.join(root, f)
                 try:
@@ -151,6 +192,7 @@ class EventArchiveService(BaseModuleService):
         total_files = 0
         total_size = 0
         for root, dirs, files in os.walk(self._archive_base):
+            dirs[:] = [d for d in dirs if not d.startswith(("_", "."))]
             for f in files:
                 total_files += 1
                 try:
@@ -164,26 +206,38 @@ class EventArchiveService(BaseModuleService):
             "total_size_bytes": total_size,
             "total_size_mb": round(total_size / (1024 * 1024), 2),
             "archive_batches": len([d for d in os.listdir(self._archive_base)
-                                    if os.path.isdir(os.path.join(self._archive_base, d))]) if os.path.exists(self._archive_base) else 0,
+                                    if os.path.isdir(os.path.join(self._archive_base, d))
+                                    and not d.startswith(("_", "."))]) if os.path.exists(self._archive_base) else 0,
             "history": self._archive_history[-10:],
         }
 
     def restore_from_archive(self, archive_file: str) -> dict[str, Any]:
-        """从归档恢复数据。"""
+        """从归档恢复数据（兼容旧接口，自动识别 zlib / gzip v2 / JSON）。"""
+        from app.services.archive_v2 import (
+            ArchiveError, read_gzip_v2, read_legacy_archive, verify_gzip_payload,
+        )
+
         for root, dirs, files in os.walk(self._archive_base):
+            dirs[:] = [d for d in dirs if not d.startswith(("_", "."))]
             for f in files:
                 if f == archive_file or f.startswith(archive_file):
                     filepath = os.path.join(root, f)
                     try:
-                        if f.endswith(".zlib"):
-                            with open(filepath, "rb") as src:
-                                decompressed = zlib.decompress(src.read())
-                            return {"ok": True, "data": decompressed.decode()}
-                        else:
-                            with open(filepath, "r") as src:
-                                return {"ok": True, "data": src.read()}
-                    except (OSError, zlib.error):
-                        return {"ok": False, "message": "归档文件损坏或不存在"}
+                        if f.endswith((".gzip", ".gz")):
+                            info = read_gzip_v2(filepath)
+                            verification = verify_gzip_payload(info["payload"])
+                            if not verification["ok"]:
+                                return {
+                                    "ok": False,
+                                    "message": "归档文件校验失败: " + "; ".join(verification["errors"]),
+                                }
+                            return {"ok": True, "data": json.dumps(
+                                info["payload"].get("events", []), ensure_ascii=False,
+                            )}
+                        info = read_legacy_archive(filepath)
+                        return {"ok": True, "data": json.dumps(info["records"], ensure_ascii=False)}
+                    except ArchiveError as exc:
+                        return {"ok": False, "message": f"归档文件损坏或不可读: {exc.message}"}
         return {"ok": False, "message": "归档文件未找到"}
 
     def domain_snapshot(self) -> dict[str, Any]:
